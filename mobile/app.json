@@ -27,11 +27,25 @@
       "edgeToEdgeEnabled": true,
       "permissions": [
         "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.CAMERA"
       ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "ac0d1db4-b30d-4b80-8918-22fd884b27f3"
+      }
+    },
+    "owner": "clarksonearl",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/ac0d1db4-b30d-4b80-8918-22fd884b27f3"
     }
   }
 }

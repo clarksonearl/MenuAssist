@@ -9,7 +9,7 @@ import {
   ScrollView, 
   ActivityIndicator,
   Platform,
-  Modal 
+  Modal
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system';
@@ -17,7 +17,7 @@ import * as FileSystem from 'expo-file-system';
 // Helper to get API base URL based on platform
 // For physical devices, replace 'localhost' with your computer's IP address
 // Find your IP with: ifconfig | grep "inet " | grep -v 127.0.0.1
-const COMPUTER_IP = '192.168.1.43'; // Update this with your computer's IP if testing on physical device
+const COMPUTER_IP = '192.168.1.24'; // Update this with your computer's IP if testing on physical device
 
 const getApiBaseUrl = () => {
   if (Platform.OS === 'android') {
@@ -31,6 +31,9 @@ const getApiBaseUrl = () => {
   // return 'http://localhost:3000'; // Use this for iOS simulator
 };
 
+import ItemDetailPopup from './ItemDetailPopup';
+import MenyouLogo from './MenyouLogo';
+
 export default function App() {
   const [gluten, setGluten] = useState(false);
   const [dairy, setDairy] = useState(false);
@@ -40,6 +43,10 @@ export default function App() {
   const [error, setError] = useState(null);
   const [disclaimerAccepted, setDisclaimerAccepted] = useState(false);
   const [showDisclaimerModal, setShowDisclaimerModal] = useState(false);
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [isPopupVisible, setIsPopupVisible] = useState(false);
+  const [kitchenNoticeDismissed, setKitchenNoticeDismissed] = useState(false);
+  const [scanId, setScanId] = useState(0);
 
   const pickImage = async () => {
     try {
@@ -169,6 +176,9 @@ export default function App() {
 
       const data = await response.json();
       setResults(data);
+      // Reset kitchen notice for new scan
+      setScanId(prev => prev + 1);
+      setKitchenNoticeDismissed(false);
     } catch (err) {
       console.error('Error analyzing menu:', err);
       let errorMessage = 'Failed to analyze menu. Please try again.';
@@ -187,11 +197,23 @@ export default function App() {
     }
   };
 
+  // Handler to open popup for an item
+  const handleItemPress = (item, sourceArray) => {
+    setSelectedItem({ 
+      ...item, 
+      _sourceArray: sourceArray,
+      _activeRestrictions: { gluten, dairy }
+    });
+    setIsPopupVisible(true);
+  };
+
   return (
     <View style={styles.container}>
       <StatusBar style="auto" />
       <ScrollView contentContainerStyle={styles.scrollContent}>
-        <Text style={styles.title}>Menu Safe MVP</Text>
+        <View style={styles.header}>
+          <MenyouLogo height={36} />
+        </View>
 
         {/* Restrictions Section */}
         <View style={styles.section}>
@@ -326,15 +348,46 @@ export default function App() {
               <Text style={styles.disclaimer}>{results.disclaimer}</Text>
             )}
 
-            {/* SAFE Section */}
+            {/* Kitchen Notice Banner */}
+            {!kitchenNoticeDismissed && (
+              <View style={styles.kitchenNoticeBanner}>
+                <View style={styles.kitchenNoticeContent}>
+                  <Text style={styles.kitchenNoticeTitle}>Kitchen Notice</Text>
+                  <Text style={styles.kitchenNoticeText}>
+                    Most restaurants use shared grills, fryers, and prep areas. If cross-contact is a concern, always ask your server before ordering.
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  onPress={() => setKitchenNoticeDismissed(true)}
+                  style={styles.kitchenNoticeDismiss}
+                  accessibilityRole="button"
+                  accessibilityLabel="Dismiss kitchen notice"
+                >
+                  <Text style={styles.kitchenNoticeDismissText}>✕</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+
+            {/* Generally OK Section */}
             {results.safe && results.safe.length > 0 && (
               <View style={styles.resultSection}>
-                <Text style={styles.resultSectionTitle}>SAFE</Text>
+                <Text style={styles.resultSectionTitle}>Generally OK</Text>
                 {results.safe.map((item, index) => (
-                  <View key={index} style={styles.resultItem}>
-                    <Text style={styles.resultItemName}>{item.name}</Text>
-                    <Text style={styles.resultItemReason}>— {item.reason}</Text>
-                  </View>
+                  <TouchableOpacity
+                    key={index}
+                    style={[styles.resultItemRow, styles.generallyOkRow]}
+                    onPress={() => handleItemPress(item, 'safe')}
+                    accessibilityRole="button"
+                    accessibilityLabel={`View details for ${item.name}`}
+                  >
+                    <View style={styles.resultItemContent}>
+                      <View style={styles.resultItemTextContainer}>
+                        <Text style={styles.resultItemName}>{item.name}</Text>
+                        <Text style={styles.resultItemHint}>Tap for info</Text>
+                      </View>
+                      <Text style={styles.chevron}>›</Text>
+                    </View>
+                  </TouchableOpacity>
                 ))}
               </View>
             )}
@@ -344,15 +397,37 @@ export default function App() {
               <View style={styles.resultSection}>
                 <Text style={[styles.resultSectionTitle, styles.cautionTitle]}>CAUTION</Text>
                 {results.caution.map((item, index) => (
-                  <View key={index} style={styles.resultItem}>
-                    <Text style={styles.resultItemName}>{item.name}</Text>
-                    <Text style={styles.resultItemReason}>— {item.reason}</Text>
-                  </View>
+                  <TouchableOpacity
+                    key={index}
+                    style={[styles.resultItemRow, styles.cautionRow]}
+                    onPress={() => handleItemPress(item, 'caution')}
+                    accessibilityRole="button"
+                    accessibilityLabel={`View details for ${item.name}`}
+                  >
+                    <View style={styles.resultItemContent}>
+                      <View style={styles.resultItemTextContainer}>
+                        <Text style={styles.resultItemName}>{item.name}</Text>
+                        <Text style={styles.resultItemHint}>Tap for info</Text>
+                      </View>
+                      <Text style={styles.chevron}>›</Text>
+                    </View>
+                  </TouchableOpacity>
                 ))}
               </View>
             )}
           </View>
         )}
+
+        {/* Item Detail Popup */}
+        <ItemDetailPopup
+          visible={isPopupVisible}
+          item={selectedItem}
+          activeRestrictions={{ gluten, dairy }}
+          onClose={() => {
+            setIsPopupVisible(false);
+            setSelectedItem(null);
+          }}
+        />
       </ScrollView>
     </View>
   );
@@ -367,11 +442,10 @@ const styles = StyleSheet.create({
     padding: 20,
     paddingTop: 60,
   },
-  title: {
-    fontSize: 28,
-    fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 30,
+  header: {
+    alignItems: 'center',
+    marginBottom: 20,
+    paddingTop: 10,
   },
   section: {
     marginBottom: 20,
@@ -537,12 +611,20 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
   resultSection: {
-    marginBottom: 25,
+    marginBottom: 20,
+    marginTop: 8,
   },
   resultSectionTitle: {
     fontSize: 20,
     fontWeight: 'bold',
     color: '#34C759',
+    marginBottom: 12,
+    marginTop: 4,
+  },
+  generallyOkHelper: {
+    fontSize: 12,
+    color: '#666',
+    fontStyle: 'italic',
     marginBottom: 12,
   },
   cautionTitle: {
@@ -551,19 +633,77 @@ const styles = StyleSheet.create({
   avoidTitle: {
     color: '#FF3B30',
   },
-  resultItem: {
-    marginBottom: 12,
-    paddingBottom: 12,
+  resultItemRow: {
+    paddingVertical: 14,
+    paddingHorizontal: 16,
     borderBottomWidth: 1,
     borderBottomColor: '#e0e0e0',
+    borderRadius: 8,
+    marginBottom: 4,
+  },
+  generallyOkRow: {
+    backgroundColor: 'rgba(52, 199, 89, 0.08)',
+  },
+  cautionRow: {
+    backgroundColor: 'rgba(255, 149, 0, 0.08)',
+  },
+  resultItemContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  resultItemTextContainer: {
+    flex: 1,
   },
   resultItemName: {
     fontSize: 16,
     fontWeight: '600',
     marginBottom: 4,
+    color: '#333',
   },
-  resultItemReason: {
+  resultItemHint: {
+    fontSize: 13,
+    color: '#999',
+  },
+  chevron: {
+    fontSize: 24,
+    color: '#999',
+    marginLeft: 12,
+  },
+  kitchenNoticeBanner: {
+    backgroundColor: '#FFF3CD',
+    borderWidth: 1,
+    borderColor: '#FFE69C',
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 20,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+  },
+  kitchenNoticeContent: {
+    flex: 1,
+    marginRight: 12,
+  },
+  kitchenNoticeTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#856404',
+    marginBottom: 6,
+  },
+  kitchenNoticeText: {
     fontSize: 14,
-    color: '#666',
+    color: '#856404',
+    lineHeight: 20,
+  },
+  kitchenNoticeDismiss: {
+    width: 24,
+    height: 24,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  kitchenNoticeDismissText: {
+    fontSize: 18,
+    color: '#856404',
+    fontWeight: 'bold',
   },
 });

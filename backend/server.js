@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const OpenAI = require('openai');
+const { buildLocalKnowledgeContext } = require('./localKnowledgeAggregator');
 const app = express();
 const PORT = 3000;
 
@@ -73,6 +74,12 @@ app.post('/api/analyze-menu', async (req, res) => {
     return r;
   }).join(' and/or ');
 
+  // Convert restrictions array to toggledAllergens object for Local Knowledge
+  const toggledAllergens = {
+    gluten: restrictions.includes('gluten'),
+    dairy: restrictions.includes('dairy')
+  };
+
   // Check if API key is configured
   if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.includes('your_openai_api_key')) {
     console.error('OpenAI API key not configured');
@@ -84,21 +91,195 @@ app.post('/api/analyze-menu', async (req, res) => {
   }
 
   try {
-    console.log('Calling OpenAI API with model: gpt-4o');
+    // STEP 1: Extract menu items from image (first pass for Local Knowledge)
+    console.log('Step 1: Extracting menu items for Local Knowledge analysis...');
+    let localKnowledgeFindings = null;
+    
+    try {
+      // Quick extraction pass to get menu item names
+      const extractionResponse = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          {
+            role: 'system',
+            content: 'Extract menu item names from this menu image. Return a JSON object with an "items" array.'
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'Extract all menu item names from this image. Return ONLY a JSON object like: {"items": ["Item 1", "Item 2", "Item 3"]}. No descriptions, just names.'
+              },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: `data:image/jpeg;base64,${base64Image}`
+                }
+              }
+            ]
+          }
+        ],
+        max_tokens: 2000,
+        temperature: 0.1,
+        response_format: { type: 'json_object' }
+      });
+
+      const extractionContent = extractionResponse.choices[0].message.content;
+      let menuItems = [];
+      
+      try {
+        const extractionData = JSON.parse(extractionContent);
+        menuItems = Array.isArray(extractionData.items) ? extractionData.items : [];
+      } catch (parseError) {
+        console.log('Could not parse menu items extraction, skipping Local Knowledge');
+      }
+
+      // Run Local Knowledge on each menu item
+      if (menuItems.length > 0) {
+        const allLocalKnowledgeOutcomes = [];
+        const seenOutcomes = new Set(); // Deduplication by (name + outcome + allergenSummary)
+        
+        for (const itemName of menuItems) {
+          if (typeof itemName === 'string' && itemName.trim().length > 0) {
+            const localKnowledge = buildLocalKnowledgeContext(itemName, toggledAllergens);
+            if (localKnowledge && localKnowledge.outcomes.length > 0) {
+              // Add outcomes with deduplication
+              for (const outcome of localKnowledge.outcomes) {
+                // Create dedupe key: name + outcome + allergenSummary
+                const name = outcome.itemName || localKnowledge.detected?.[0] || itemName;
+                const outcomeType = outcome.outcome || outcome.internalOutcome || 'unknown';
+                const allergenSummaryStr = Array.isArray(outcome.allergenSummary) 
+                  ? outcome.allergenSummary.sort().join(',') 
+                  : '';
+                const dedupeKey = `${name}|${outcomeType}|${allergenSummaryStr}`;
+                
+                if (!seenOutcomes.has(dedupeKey)) {
+                  seenOutcomes.add(dedupeKey);
+                  // Ensure itemName is set
+                  if (!outcome.itemName) {
+                    outcome.itemName = name;
+                  }
+                  allLocalKnowledgeOutcomes.push(outcome);
+                }
+              }
+            }
+          }
+        }
+
+        // Filter and format Local Knowledge findings
+        if (allLocalKnowledgeOutcomes.length > 0) {
+          // Limit to max 15 outcomes, sorted by severity (NOT AN OPTION first)
+          const sortedOutcomes = allLocalKnowledgeOutcomes
+            .sort((a, b) => {
+              const aSeverity = a.outcome === 'NOT AN OPTION' ? 0 : 1;
+              const bSeverity = b.outcome === 'NOT AN OPTION' ? 0 : 1;
+              return aSeverity - bSeverity;
+            })
+            .slice(0, 15);
+          
+          localKnowledgeFindings = {
+            outcomes: sortedOutcomes,
+            toggledAllergens: toggledAllergens
+          };
+          console.log(`Local Knowledge found ${sortedOutcomes.length} relevant outcomes`);
+        }
+      }
+    } catch (localKnowledgeError) {
+      console.error('Local Knowledge extraction error (non-fatal):', localKnowledgeError.message);
+      // Continue with AI analysis even if Local Knowledge fails
+    }
+
+    // STEP 2: Full AI analysis with Local Knowledge context
+    console.log('Step 2: Calling OpenAI API with model: gpt-4o (with Local Knowledge context)');
+    
+    // Build Local Knowledge context string for AI prompt (standardized format)
+    let localKnowledgeContext = '';
+    if (localKnowledgeFindings && localKnowledgeFindings.outcomes.length > 0) {
+      const toggles = localKnowledgeFindings.toggledAllergens || toggledAllergens;
+      const glutenToggle = toggles.gluten ? 'true' : 'false';
+      const dairyToggle = toggles.dairy ? 'true' : 'false';
+      
+      // Build summary bullets (1-3 items)
+      const summaryBullets = [];
+      const notAnOptionCount = localKnowledgeFindings.outcomes.filter(o => o.outcome === 'NOT AN OPTION').length;
+      const cautionCount = localKnowledgeFindings.outcomes.filter(o => o.outcome === 'CAUTION').length;
+      
+      if (notAnOptionCount > 0) {
+        const allergenList = Array.from(new Set(
+          localKnowledgeFindings.outcomes
+            .filter(o => o.outcome === 'NOT AN OPTION')
+            .flatMap(o => o.allergenSummary || [])
+        )).join(' and/or ');
+        summaryBullets.push(`${notAnOptionCount} item(s) contain ${allergenList} as a core ingredient that cannot be removed.`);
+      }
+      
+      if (cautionCount > 0) {
+        const allergenList = Array.from(new Set(
+          localKnowledgeFindings.outcomes
+            .filter(o => o.outcome === 'CAUTION')
+            .flatMap(o => o.allergenSummary || [])
+        )).join(' and/or ');
+        summaryBullets.push(`${cautionCount} item(s) may contain ${allergenList} depending on preparation or ingredients.`);
+      }
+      
+      // Build detailed findings list
+      const findingsList = localKnowledgeFindings.outcomes.map((outcome, index) => {
+        const itemName = outcome.itemName || 'Unknown Item';
+        const outcomeType = outcome.outcome || outcome.internalOutcome || 'CAUTION';
+        const allergenSummary = Array.isArray(outcome.allergenSummary) 
+          ? outcome.allergenSummary.join(', ') 
+          : 'unknown';
+        const reason = outcome.guidance || outcome.reasonForCaution || 'Requires verification';
+        const serverQuestions = Array.isArray(outcome.suggestedServerQuestions) 
+          ? outcome.suggestedServerQuestions.slice(0, 2).join(' | ') 
+          : 'Ask about ingredients and preparation';
+        
+        return `${index + 1}) [${outcomeType}] ${itemName}
+   Allergen(s): ${allergenSummary}
+   Reason: ${reason}
+   Ask the server: ${serverQuestions}`;
+      }).join('\n\n');
+      
+      localKnowledgeContext = `
+
+LOCAL KNOWLEDGE FINDINGS (deterministic; do not override)
+Toggles: gluten=${glutenToggle}, dairy=${dairyToggle}
+
+Summary:
+${summaryBullets.map(b => `- ${b}`).join('\n')}
+
+Findings (sorted by severity):
+${findingsList}
+
+Rules:
+- Only include outcomes relevant to toggled allergens
+- NOT AN OPTION always listed before CAUTION
+- Do not include GENERALLY OK items
+- Local Knowledge is authoritative; do not override or soften these findings`;
+    }
+
     // Call OpenAI Vision API
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
         {
           role: 'system',
-          content: `You are a dietary restriction analyzer for restaurant menus. Analyze menu items and categorize them based on the user's restrictions. Return ONLY valid JSON with no markdown formatting, no code blocks, no extra text.`
+          content: `You are a dietary restriction analyzer for restaurant menus. Analyze menu items and categorize them based on the user's restrictions. Return ONLY valid JSON with no markdown formatting, no code blocks, no extra text.
+
+LOCAL KNOWLEDGE IS AUTHORITATIVE.
+- If Local Knowledge marks something as "NOT AN OPTION", do NOT suggest it as possible unless the menu explicitly states a compliant alternative (e.g., gluten-free bun, dairy-free dressing).
+- If Local Knowledge marks something as "CAUTION", do NOT present it as safe; present it as requiring confirmation and include the suggested server questions.
+- Never override Local Knowledge with assumptions or general food knowledge.
+- If there is a conflict between AI reasoning and Local Knowledge, Local Knowledge always wins.
+- Only discuss allergens that the user explicitly toggled (gluten, dairy).`
         },
         {
           role: 'user',
           content: [
             {
               type: 'text',
-              text: `Perform a DEEP, COMPREHENSIVE, THOROUGH analysis of this restaurant menu image. This requires careful, methodical analysis - take 15-30 seconds to think through each item. The goal is FOOD FREEDOM WITH SAFETY - help users eat anywhere without worry by providing complete, accurate information.
+              text: `Perform a DEEP, COMPREHENSIVE, THOROUGH analysis of this restaurant menu image. This requires careful, methodical analysis - take 15-30 seconds to think through each item. The goal is FOOD FREEDOM WITH SAFETY - help users eat anywhere without worry by providing complete, accurate information.${localKnowledgeContext}
 
 ANALYSIS METHODOLOGY (FOLLOW THIS ORDER FOR EACH ITEM):
 1. FIRST: Identify the dish name and recall TRADITIONAL INGREDIENT KNOWLEDGE
@@ -347,6 +528,154 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
       }
     }
 
+    // Helper function: Parse reason text into structured format
+    function parseReasonToStructured(reasonText, restrictions) {
+      if (!reasonText || typeof reasonText !== 'string' || reasonText.trim().length === 0) {
+        const restrictionText = restrictions.join(' and/or ');
+        return {
+          reasons: [{ type: 'UNKNOWN', detail: 'Requires verification' }],
+          askServer: [`Can you confirm if this is ${restrictionText} free and how it's prepared?`],
+          confidence: 'LOW'
+        };
+      }
+
+      const normalizedReason = reasonText.toLowerCase();
+      const reasons = [];
+      const askServer = [];
+      let confidence = 'MEDIUM';
+
+      // Dairy patterns
+      const dairyPatterns = [
+        { pattern: /\b(butter|buttered|cooked with butter|finished with butter)\b/i, type: 'PREPARATION', detail: 'May be cooked or finished with butter' },
+        { pattern: /\b(cheese|contains cheese|with cheese)\b/i, type: 'INGREDIENT', detail: 'Contains cheese' },
+        { pattern: /\b(cream|cream-based|contains cream)\b/i, type: 'INGREDIENT', detail: 'Contains cream' },
+        { pattern: /\b(milk|contains milk)\b/i, type: 'INGREDIENT', detail: 'Contains milk' },
+        { pattern: /\b(mayo|mayonnaise|aioli|ranch|sour cream)\b/i, type: 'INGREDIENT', detail: 'May contain dairy-based condiments' }
+      ];
+
+      // Gluten patterns
+      const glutenPatterns = [
+        { pattern: /\b(bun|bread|contains bread|with bread)\b/i, type: 'INGREDIENT', detail: 'Contains bread/bun' },
+        { pattern: /\b(pasta|contains pasta)\b/i, type: 'INGREDIENT', detail: 'Contains pasta' },
+        { pattern: /\b(croutons|contains croutons)\b/i, type: 'INGREDIENT', detail: 'Contains croutons' },
+        { pattern: /\b(breaded|battered|fried with batter)\b/i, type: 'PREPARATION', detail: 'May be breaded or battered' }
+      ];
+
+      // Cross-contact patterns
+      const crossContactPatterns = [
+        { pattern: /\b(shared fryer|shared grill|cross contamination|cross contact)\b/i, type: 'CROSS_CONTACT', detail: 'Risk of cross-contact from shared equipment' }
+      ];
+
+      // Check all patterns
+      const allPatterns = [...dairyPatterns, ...glutenPatterns, ...crossContactPatterns];
+      const matchedPatterns = [];
+
+      for (const { pattern, type, detail } of allPatterns) {
+        if (pattern.test(normalizedReason)) {
+          // Avoid duplicates
+          if (!matchedPatterns.some(p => p.type === type && p.detail === detail)) {
+            matchedPatterns.push({ type, detail });
+          }
+        }
+      }
+
+      // If no patterns matched, use UNKNOWN
+      if (matchedPatterns.length === 0) {
+        reasons.push({ type: 'UNKNOWN', detail: reasonText.trim() });
+      } else {
+        reasons.push(...matchedPatterns);
+      }
+
+      // Generate askServer questions based on reason types
+      const hasPreparation = reasons.some(r => r.type === 'PREPARATION');
+      const hasIngredient = reasons.some(r => r.type === 'INGREDIENT');
+      const hasCrossContact = reasons.some(r => r.type === 'CROSS_CONTACT');
+      const hasUnknown = reasons.some(r => r.type === 'UNKNOWN');
+
+      if (hasCrossContact) {
+        if (restrictions.includes('gluten')) {
+          askServer.push('Is this prepared in a shared fryer with breaded items?');
+        } else if (restrictions.includes('dairy')) {
+          askServer.push('Is this prepared in a shared fryer or grill with dairy items?');
+        } else {
+          askServer.push('Is this prepared in a shared fryer or grill?');
+        }
+      }
+
+      if (hasPreparation) {
+        if (restrictions.includes('dairy')) {
+          askServer.push('Is butter or dairy used in cooking or finishing?');
+          askServer.push('Can it be cooked with oil only?');
+        }
+      }
+
+      if (hasIngredient) {
+        const restrictionText = restrictions.join(' or ');
+        reasons.filter(r => r.type === 'INGREDIENT').forEach(reason => {
+          if (reason.detail.includes('cheese')) {
+            askServer.push('Does this contain cheese?');
+            askServer.push('Can it be made without cheese?');
+          } else if (reason.detail.includes('cream')) {
+            askServer.push('Does this contain cream?');
+            askServer.push('Can it be made without cream?');
+          } else if (reason.detail.includes('bread') || reason.detail.includes('bun')) {
+            askServer.push('Does this contain bread?');
+            askServer.push('Is a gluten-free option available?');
+          } else if (reason.detail.includes('pasta')) {
+            askServer.push('Does this contain pasta?');
+            askServer.push('Is gluten-free pasta available?');
+          } else {
+            askServer.push(`Does this contain ${restrictionText}?`);
+            askServer.push(`Can it be made without ${restrictionText}?`);
+          }
+        });
+      }
+
+      if (hasUnknown && askServer.length === 0) {
+        const restrictionText = restrictions.join(' and/or ');
+        askServer.push(`Can you confirm if this is ${restrictionText} free and how it's prepared?`);
+      }
+
+      // Remove duplicates from askServer
+      const uniqueAskServer = [...new Set(askServer)];
+
+      return {
+        reasons,
+        askServer: uniqueAskServer.length > 0 ? uniqueAskServer : [`Can you confirm if this is ${restrictions.join(' and/or ')} free and how it's prepared?`],
+        confidence
+      };
+    }
+
+    // Helper function: Derive compatibility reason string from structured data
+    function deriveCompatibilityReason(reasons, askServer) {
+      if (!reasons || reasons.length === 0) {
+        return 'Requires verification';
+      }
+
+      const primaryReason = reasons[0];
+      const firstQuestion = askServer && askServer.length > 0 ? askServer[0] : null;
+
+      let compatReason = primaryReason.detail;
+
+      if (firstQuestion) {
+        // Extract key phrase from question
+        const questionPhrase = firstQuestion.toLowerCase();
+        if (questionPhrase.includes('butter')) {
+          compatReason += ' — ask: is butter used?';
+        } else if (questionPhrase.includes('shared fryer')) {
+          compatReason += ' — ask about shared fryer';
+        } else if (questionPhrase.includes('shared grill')) {
+          compatReason += ' — ask about shared grill';
+        } else if (questionPhrase.includes('contain')) {
+          compatReason += ' — ask: ' + firstQuestion.replace(/^does this /i, '').replace(/\?$/, '');
+        } else {
+          compatReason += ' — ask: ' + firstQuestion.replace(/\?$/, '');
+        }
+      }
+
+      return compatReason;
+    }
+
     // Apply safety bias: ensure structure exists
     let safe = Array.isArray(menuData.safe) ? menuData.safe : [];
     let caution = Array.isArray(menuData.caution) ? menuData.caution : [];
@@ -432,6 +761,149 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
       
       // If it can't be modified, don't list it in caution
       return canBeModified;
+    });
+
+    // PHASE 1: Enrich items with Local Knowledge metadata
+    // Helper to normalize item names for matching
+    const normalizeName = (str) => {
+      if (!str || typeof str !== 'string') return '';
+      return str
+        .toLowerCase()
+        .trim()
+        .replace(/[^\w\s]/g, '') // Remove punctuation
+        .replace(/\s+/g, ' '); // Collapse spaces
+    };
+
+    // Build lookup map from Local Knowledge outcomes
+    const localKnowledgeMap = new Map();
+    if (localKnowledgeFindings && localKnowledgeFindings.outcomes) {
+      for (const outcome of localKnowledgeFindings.outcomes) {
+        const itemName = outcome.itemName || '';
+        if (itemName) {
+          const normalized = normalizeName(itemName);
+          // Store by normalized name, keeping the most severe outcome if duplicates
+          if (!localKnowledgeMap.has(normalized) || 
+              (outcome.outcome === 'NOT AN OPTION' && localKnowledgeMap.get(normalized).outcome !== 'NOT AN OPTION')) {
+            localKnowledgeMap.set(normalized, outcome);
+          }
+        }
+      }
+    }
+
+    // Enrich safe array items
+    safe = safe.map(item => {
+      const normalized = normalizeName(item.name || '');
+      const matchedOutcome = localKnowledgeMap.get(normalized);
+      
+      if (matchedOutcome) {
+        const enriched = { ...item };
+        // Attach metadata if available
+        if (Array.isArray(matchedOutcome.askServer) && matchedOutcome.askServer.length > 0) {
+          enriched.askServer = matchedOutcome.askServer;
+        }
+        if (Array.isArray(matchedOutcome.orderItLikeThis) && matchedOutcome.orderItLikeThis.length > 0) {
+          enriched.orderItLikeThis = matchedOutcome.orderItLikeThis;
+        }
+        if (matchedOutcome.bestReason) {
+          enriched.bestReason = matchedOutcome.bestReason;
+        }
+        // Derive status: safe array defaults to SAFE unless Local Knowledge says otherwise
+        const outcomeType = matchedOutcome.outcome || matchedOutcome.internalOutcome;
+        if (outcomeType === 'NOT AN OPTION') {
+          enriched.status = 'NOT AN OPTION';
+        } else {
+          enriched.status = 'SAFE';
+        }
+        
+        // PHASE 1: Add structured fields for Local Knowledge items
+        const guidanceText = matchedOutcome.bestReason || matchedOutcome.guidance || item.reason || 'Requires verification';
+        enriched.reasons = [{ type: 'UNKNOWN', detail: guidanceText }];
+        enriched.confidence = 'HIGH';
+        enriched.askServer = enriched.askServer || [];
+        
+        return enriched;
+      }
+      
+      // No match: AI-only item - parse reason to structured format
+      try {
+        const structured = parseReasonToStructured(item.reason, restrictions);
+        return {
+          ...item,
+          status: 'SAFE',
+          reasons: structured.reasons,
+          askServer: structured.askServer,
+          confidence: structured.confidence,
+          reasonCompat: deriveCompatibilityReason(structured.reasons, structured.askServer)
+        };
+      } catch (parseError) {
+        // Minimal logging only if parsing fails
+        console.error('Error parsing reason for item:', item.name, parseError.message);
+        return {
+          ...item,
+          status: 'SAFE',
+          reasons: [{ type: 'UNKNOWN', detail: item.reason || 'Requires verification' }],
+          askServer: [`Can you confirm if this is ${restrictions.join(' and/or ')} free and how it's prepared?`],
+          confidence: 'LOW'
+        };
+      }
+    });
+
+    // Enrich caution array items
+    caution = caution.map(item => {
+      const normalized = normalizeName(item.name || '');
+      const matchedOutcome = localKnowledgeMap.get(normalized);
+      
+      if (matchedOutcome) {
+        const enriched = { ...item };
+        // Attach metadata if available
+        if (Array.isArray(matchedOutcome.askServer) && matchedOutcome.askServer.length > 0) {
+          enriched.askServer = matchedOutcome.askServer;
+        }
+        if (Array.isArray(matchedOutcome.orderItLikeThis) && matchedOutcome.orderItLikeThis.length > 0) {
+          enriched.orderItLikeThis = matchedOutcome.orderItLikeThis;
+        }
+        if (matchedOutcome.bestReason) {
+          enriched.bestReason = matchedOutcome.bestReason;
+        }
+        // Derive status: caution array defaults to ASK unless Local Knowledge says NOT AN OPTION
+        const outcomeType = matchedOutcome.outcome || matchedOutcome.internalOutcome;
+        if (outcomeType === 'NOT AN OPTION') {
+          enriched.status = 'NOT AN OPTION';
+        } else {
+          enriched.status = 'ASK';
+        }
+        
+        // PHASE 1: Add structured fields for Local Knowledge items
+        const guidanceText = matchedOutcome.bestReason || matchedOutcome.guidance || item.reason || 'Requires verification';
+        enriched.reasons = [{ type: 'UNKNOWN', detail: guidanceText }];
+        enriched.confidence = 'HIGH';
+        enriched.askServer = enriched.askServer || [];
+        
+        return enriched;
+      }
+      
+      // No match: AI-only item - parse reason to structured format
+      try {
+        const structured = parseReasonToStructured(item.reason, restrictions);
+        return {
+          ...item,
+          status: 'ASK',
+          reasons: structured.reasons,
+          askServer: structured.askServer,
+          confidence: structured.confidence,
+          reasonCompat: deriveCompatibilityReason(structured.reasons, structured.askServer)
+        };
+      } catch (parseError) {
+        // Minimal logging only if parsing fails
+        console.error('Error parsing reason for item:', item.name, parseError.message);
+        return {
+          ...item,
+          status: 'ASK',
+          reasons: [{ type: 'UNKNOWN', detail: item.reason || 'Requires verification' }],
+          askServer: [`Can you confirm if this is ${restrictions.join(' and/or ')} free and how it's prepared?`],
+          confidence: 'LOW'
+        };
+      }
     });
 
     // Return structured response
