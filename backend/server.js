@@ -4,7 +4,7 @@ const cors = require('cors');
 const OpenAI = require('openai');
 const { buildLocalKnowledgeContext } = require('./localKnowledgeAggregator');
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -967,9 +967,8 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
   }
 });
 
-// Start server - listen on all interfaces (0.0.0.0) to allow network access
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`Server accessible on network at http://192.168.1.43:${PORT}`);
+// Start server
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });
 
