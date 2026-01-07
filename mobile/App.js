@@ -14,21 +14,8 @@ import {
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system';
 
-// Helper to get API base URL based on platform
-// For physical devices, replace 'localhost' with your computer's IP address
-// Find your IP with: ifconfig | grep "inet " | grep -v 127.0.0.1
-const COMPUTER_IP = '192.168.1.24'; // Update this with your computer's IP if testing on physical device
-
 const getApiBaseUrl = () => {
-  if (Platform.OS === 'android') {
-    // Android emulator uses 10.0.2.2 to reach host machine
-    return 'http://10.0.2.2:3000';
-  }
-  
-  // For iOS: Use IP address for physical devices, localhost for simulator
-  // If testing on a physical iOS device, uncomment the next line and comment out localhost:
-  return `http://${COMPUTER_IP}:3000`;
-  // return 'http://localhost:3000'; // Use this for iOS simulator
+  return 'https://menuassist-backend.onrender.com';
 };
 
 import ItemDetailPopup from './ItemDetailPopup';
@@ -186,7 +173,7 @@ export default function App() {
       if (err.name === 'AbortError') {
         errorMessage = 'Request timed out. The image might be too large or the server is slow.';
       } else if (err.message.includes('Network request failed') || err.message.includes('Failed to fetch')) {
-        errorMessage = 'Cannot connect to server. Make sure:\n1. Backend is running on port 3000\n2. Phone and computer are on same Wi-Fi\n3. Firewall allows port 3000';
+        errorMessage = 'Cannot connect to server. Please check your internet connection and try again.';
       } else if (err.message) {
         errorMessage = err.message;
       }
