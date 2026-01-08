@@ -45,7 +45,7 @@ app.post('/api/analyze-menu', upload.single('image'), async (req, res) => {
     return res.status(400).json({
       success: false,
       error: 'INVALID_REQUEST',
-      message: 'Image file is required'
+      message: 'Image file required'
     });
   }
   

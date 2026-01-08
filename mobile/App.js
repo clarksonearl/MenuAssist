@@ -161,6 +161,9 @@ export default function App() {
       const response = await fetch(apiUrl, {
         method: 'POST',
         body: formData,
+        headers: {
+          Accept: 'application/json',
+        },
         signal: controller.signal,
       });
       const request_ms = Date.now() - tRequestStart;
