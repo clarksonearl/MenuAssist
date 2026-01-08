@@ -13,6 +13,8 @@ import {
 } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system';
+// Install: npm install expo-image-manipulator
+import * as ImageManipulator from 'expo-image-manipulator';
 
 const getApiBaseUrl = () => {
   return 'https://menuassist-backend.onrender.com';
@@ -115,54 +117,84 @@ export default function App() {
     setError(null);
     setResults(null);
 
+    const t0 = Date.now();
+
     try {
       // Build restrictions array
       const restrictions = [];
       if (gluten) restrictions.push('gluten');
       if (dairy) restrictions.push('dairy');
 
-      // Get image data URL (base64 if available, otherwise convert from URI)
-      let imageDataUrl;
-      if (photo.base64) {
-        imageDataUrl = `data:image/jpeg;base64,${photo.base64}`;
-      } else {
-        // Fallback: convert from URI if base64 not available
-        const base64 = await FileSystem.readAsStringAsync(photo.uri, {
-          encoding: 'base64',
-        });
-        imageDataUrl = `data:image/jpeg;base64,${base64}`;
-      }
+      // Optimize and compress image
+      const tOptimizeStart = Date.now();
+      
+      // Optimize image: resize to 1400px width, compress to 0.7, JPEG format
+      const optimized = await ImageManipulator.manipulateAsync(
+        photo.uri,
+        [{ resize: { width: 1400 } }],
+        { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG }
+      );
+      
+      const optimize_ms = Date.now() - tOptimizeStart;
+      
+      // Get file info for multipart upload
+      const fileInfo = await FileSystem.getInfoAsync(optimized.uri);
+      const imageSizeBytes = fileInfo.exists ? fileInfo.size : 0;
+      const optimized_file_kb = imageSizeBytes / 1024;
 
-      // Make API call
+      // Make API call with multipart/form-data
       const apiUrl = `${getApiBaseUrl()}/api/analyze-menu`;
-      console.log('Making request to:', apiUrl);
-      console.log('Platform:', Platform.OS);
-      console.log('Image data length:', imageDataUrl ? imageDataUrl.length : 0);
+      const tUploadStart = Date.now();
+      
+      const formData = new FormData();
+      formData.append('image', {
+        uri: optimized.uri,
+        type: 'image/jpeg',
+        name: 'menu.jpg',
+      });
+      formData.append('restrictions', JSON.stringify(restrictions));
       
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout for deep analysis
       
+      const tRequestStart = Date.now();
       const response = await fetch(apiUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          image: imageDataUrl,
-          restrictions: restrictions,
-        }),
+        body: formData,
         signal: controller.signal,
       });
+      const request_ms = Date.now() - tRequestStart;
       
       clearTimeout(timeoutId);
+      const upload_ms = Date.now() - tUploadStart;
+      const backend_ms = upload_ms;
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.message || `Server error: ${response.status}`);
       }
 
+      const tRenderStart = Date.now();
       const data = await response.json();
-      setResults(data);
+      
+      // Transform new response format to old format for compatibility
+      if (data.items && Array.isArray(data.items)) {
+        const transformed = {
+          success: true,
+          safe: data.items.filter(item => item.status === 'OK'),
+          caution: data.items.filter(item => item.status === 'CAUTION' || item.status === 'HARD_STOP'),
+          hard_stop: data.items.filter(item => item.status === 'HARD_STOP'),
+          disclaimer: data.disclaimer
+        };
+        setResults(transformed);
+      } else {
+        // Fallback to old format
+        setResults(data);
+      }
+      
+      const render_ms = Date.now() - tRenderStart;
+
+      console.log(`PERF: optimize_ms=${optimize_ms} optimized_file_kb=${optimized_file_kb.toFixed(2)} request_ms=${request_ms} upload_ms=${upload_ms} backend_ms=${backend_ms} render_ms=${render_ms}`);
       // Reset kitchen notice for new scan
       setScanId(prev => prev + 1);
       setKitchenNoticeDismissed(false);

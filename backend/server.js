@@ -1,10 +1,22 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
 const OpenAI = require('openai');
 const { buildLocalKnowledgeContext } = require('./localKnowledgeAggregator');
+const { isHardStop } = require('./hardStopRules');
+const { mergeResults, hasObviousDairyTerms } = require('./mergeResults');
+const scanCache = require('./cache');
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Configure multer for file uploads (memory storage)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -14,8 +26,8 @@ const openai = new OpenAI({
 // CORS middleware - allow all origins for development
 app.use(cors());
 
-// Middleware to parse JSON bodies (increase limit for base64 images)
-app.use(express.json({ limit: '50mb' }));
+// Middleware to parse JSON bodies
+app.use(express.json());
 
 // Health endpoint
 app.get('/api/health', (req, res) => {
@@ -23,23 +35,30 @@ app.get('/api/health', (req, res) => {
 });
 
 // Analyze menu endpoint
-app.post('/api/analyze-menu', async (req, res) => {
+app.post('/api/analyze-menu', upload.single('image'), async (req, res) => {
+  const requestStart = Date.now();
   console.log('Received analyze-menu request');
-  console.log('Image data length:', req.body.image ? req.body.image.length : 0);
-  console.log('Restrictions:', req.body.restrictions);
   
-  const { image, restrictions } = req.body;
-
-  // Validate image
-  if (!image || typeof image !== 'string' || !image.startsWith('data:image/')) {
+  // Validate file upload
+  if (!req.file) {
     return res.status(400).json({
       success: false,
       error: 'INVALID_REQUEST',
-      message: 'Image must be a string starting with "data:image/"'
+      message: 'Image file is required'
     });
   }
-
-  // Validate restrictions
+  
+  console.log('Image file size:', req.file.size, 'bytes');
+  console.log('Image MIME type:', req.file.mimetype);
+  
+  // Validate restrictions from form data
+  let restrictions;
+  try {
+    restrictions = JSON.parse(req.body.restrictions || '[]');
+  } catch (e) {
+    restrictions = Array.isArray(req.body.restrictions) ? req.body.restrictions : [];
+  }
+  
   if (!Array.isArray(restrictions) || restrictions.length === 0) {
     return res.status(400).json({
       success: false,
@@ -60,8 +79,23 @@ app.post('/api/analyze-menu', async (req, res) => {
     });
   }
 
-  // Extract base64 image data (remove data URL prefix)
-  const base64Image = image.replace(/^data:image\/[a-z]+;base64,/, '');
+  // Check cache
+  const cacheKey = scanCache.generateKey(req.file.buffer, restrictions);
+  const cachedResult = scanCache.get(cacheKey);
+  
+  let cacheHit = false;
+  if (cachedResult) {
+    cacheHit = true;
+    console.log('Cache HIT for key:', cacheKey.substring(0, 16) + '...');
+    const cacheResponseTime = Date.now() - requestStart;
+    console.log(`PERF: cache_hit=true cache_ms=${cacheResponseTime}`);
+    return res.json(cachedResult);
+  }
+  
+  console.log('Cache MISS for key:', cacheKey.substring(0, 16) + '...');
+
+  // Convert file buffer to base64 for OpenAI API
+  const base64Image = req.file.buffer.toString('base64');
   console.log('Base64 image length:', base64Image.length);
 
   // Build restrictions text for prompt - only mention the active restrictions
@@ -94,7 +128,11 @@ app.post('/api/analyze-menu', async (req, res) => {
     // STEP 1: Extract menu items from image (first pass for Local Knowledge)
     console.log('Step 1: Extracting menu items for Local Knowledge analysis...');
     let localKnowledgeFindings = null;
+    let hardStopItems = []; // HARD STOP items (excluded from AI)
     
+    let ocr_ms = 0;
+    let local_rules_ms = 0;
+    const tOcrStart = Date.now();
     try {
       // Quick extraction pass to get menu item names
       const extractionResponse = await openai.chat.completions.create({
@@ -135,12 +173,40 @@ app.post('/api/analyze-menu', async (req, res) => {
         console.log('Could not parse menu items extraction, skipping Local Knowledge');
       }
 
-      // Run Local Knowledge on each menu item
+      ocr_ms = Date.now() - tOcrStart;
+      const tLocalRulesStart = Date.now();
+      
+      // HARD STOP: Check items before Local Knowledge and AI
+      const filteredMenuItems = [];
+      
       if (menuItems.length > 0) {
+        for (const itemName of menuItems) {
+          if (typeof itemName === 'string' && itemName.trim().length > 0) {
+            const hardStopResult = isHardStop(itemName, toggledAllergens);
+            if (hardStopResult.hardStop) {
+              hardStopItems.push({
+                name: itemName,
+                status: 'HARD_STOP',
+                reason: hardStopResult.reason,
+                askServer: hardStopResult.ask || [],
+                allergens: hardStopResult.allergens || []
+              });
+            } else {
+              filteredMenuItems.push(itemName);
+            }
+          }
+        }
+        if (hardStopItems.length > 0) {
+          console.log(`Hard Stop: ${hardStopItems.length} items flagged (excluded from AI analysis)`);
+        }
+      }
+      
+      // Run Local Knowledge on filtered menu items (excluding hard stops)
+      if (filteredMenuItems.length > 0) {
         const allLocalKnowledgeOutcomes = [];
         const seenOutcomes = new Set(); // Deduplication by (name + outcome + allergenSummary)
         
-        for (const itemName of menuItems) {
+        for (const itemName of filteredMenuItems) {
           if (typeof itemName === 'string' && itemName.trim().length > 0) {
             const localKnowledge = buildLocalKnowledgeContext(itemName, toggledAllergens);
             if (localKnowledge && localKnowledge.outcomes.length > 0) {
@@ -185,14 +251,18 @@ app.post('/api/analyze-menu', async (req, res) => {
           console.log(`Local Knowledge found ${sortedOutcomes.length} relevant outcomes`);
         }
       }
+      local_rules_ms = Date.now() - tLocalRulesStart;
     } catch (localKnowledgeError) {
       console.error('Local Knowledge extraction error (non-fatal):', localKnowledgeError.message);
       // Continue with AI analysis even if Local Knowledge fails
+      ocr_ms = Date.now() - tOcrStart;
+      local_rules_ms = 0;
     }
 
     // STEP 2: Full AI analysis with Local Knowledge context
     console.log('Step 2: Calling OpenAI API with model: gpt-4o (with Local Knowledge context)');
     
+    const tAiStart = Date.now();
     // Build Local Knowledge context string for AI prompt (standardized format)
     let localKnowledgeContext = '';
     if (localKnowledgeFindings && localKnowledgeFindings.outcomes.length > 0) {
@@ -260,7 +330,7 @@ Rules:
     }
 
     // Call OpenAI Vision API
-    const response = await openai.chat.completions.create({
+    const aiResponse = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
         {
@@ -511,8 +581,10 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
       response_format: { type: 'json_object' }
     });
 
+    const ai_ms = Date.now() - tAiStart;
+    
     // Parse OpenAI response
-    const content = response.choices[0].message.content;
+    const content = aiResponse.choices[0].message.content;
     let menuData;
     
     try {
@@ -677,8 +749,48 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
     }
 
     // Apply safety bias: ensure structure exists
-    let safe = Array.isArray(menuData.safe) ? menuData.safe : [];
-    let caution = Array.isArray(menuData.caution) ? menuData.caution : [];
+    let aiSafe = Array.isArray(menuData.safe) ? menuData.safe : [];
+    let aiCaution = Array.isArray(menuData.caution) ? menuData.caution : [];
+
+    // Safety check: Remove items with obvious dairy terms from AI safe array when dairy-free is selected
+    const filteredAiSafe = aiSafe.filter(item => {
+      if (hasObviousDairyTerms(item, restrictions)) {
+        // Move to caution instead
+        aiCaution.push({
+          ...item,
+          reason: item.reason || 'May contain dairy - verify with staff'
+        });
+        return false;
+      }
+      return true;
+    });
+    aiSafe = filteredAiSafe;
+
+    // Merge local results (hard stops + local knowledge) with AI results
+    // This ensures local rules always take precedence
+    const merged = mergeResults(
+      { hardStopItems, localKnowledgeFindings },
+      { safe: aiSafe, caution: aiCaution },
+      restrictions
+    );
+
+    let safe = merged.safe;
+    let caution = merged.caution;
+    
+    // Build lookup map from Local Knowledge outcomes for enrichment (metadata only, not status)
+    const localKnowledgeMap = new Map();
+    if (localKnowledgeFindings && localKnowledgeFindings.outcomes) {
+      for (const outcome of localKnowledgeFindings.outcomes) {
+        const itemName = outcome.itemName || '';
+        if (itemName) {
+          const normalized = normalizeName(itemName);
+          if (!localKnowledgeMap.has(normalized) || 
+              (outcome.outcome === 'NOT AN OPTION' && localKnowledgeMap.get(normalized).outcome !== 'NOT AN OPTION')) {
+            localKnowledgeMap.set(normalized, outcome);
+          }
+        }
+      }
+    }
 
     // Ensure SAFE section is mandatory - if empty, add a default message
     if (safe.length === 0) {
@@ -763,7 +875,6 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
       return canBeModified;
     });
 
-    // PHASE 1: Enrich items with Local Knowledge metadata
     // Helper to normalize item names for matching
     const normalizeName = (str) => {
       if (!str || typeof str !== 'string') return '';
@@ -774,54 +885,23 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
         .replace(/\s+/g, ' '); // Collapse spaces
     };
 
-    // Build lookup map from Local Knowledge outcomes
-    const localKnowledgeMap = new Map();
-    if (localKnowledgeFindings && localKnowledgeFindings.outcomes) {
-      for (const outcome of localKnowledgeFindings.outcomes) {
-        const itemName = outcome.itemName || '';
-        if (itemName) {
-          const normalized = normalizeName(itemName);
-          // Store by normalized name, keeping the most severe outcome if duplicates
-          if (!localKnowledgeMap.has(normalized) || 
-              (outcome.outcome === 'NOT AN OPTION' && localKnowledgeMap.get(normalized).outcome !== 'NOT AN OPTION')) {
-            localKnowledgeMap.set(normalized, outcome);
-          }
-        }
-      }
-    }
-
-    // Enrich safe array items
+    // Enrich safe array items (add structured fields, but preserve merge status)
     safe = safe.map(item => {
       const normalized = normalizeName(item.name || '');
       const matchedOutcome = localKnowledgeMap.get(normalized);
       
-      if (matchedOutcome) {
-        const enriched = { ...item };
-        // Attach metadata if available
-        if (Array.isArray(matchedOutcome.askServer) && matchedOutcome.askServer.length > 0) {
-          enriched.askServer = matchedOutcome.askServer;
+      // If item already has structured fields from merge, preserve them
+      if (item.reasons && item.askServer) {
+        // Already enriched by merge, just add metadata if available
+        if (matchedOutcome) {
+          if (Array.isArray(matchedOutcome.orderItLikeThis) && matchedOutcome.orderItLikeThis.length > 0) {
+            item.orderItLikeThis = matchedOutcome.orderItLikeThis;
+          }
+          if (matchedOutcome.bestReason && !item.bestReason) {
+            item.bestReason = matchedOutcome.bestReason;
+          }
         }
-        if (Array.isArray(matchedOutcome.orderItLikeThis) && matchedOutcome.orderItLikeThis.length > 0) {
-          enriched.orderItLikeThis = matchedOutcome.orderItLikeThis;
-        }
-        if (matchedOutcome.bestReason) {
-          enriched.bestReason = matchedOutcome.bestReason;
-        }
-        // Derive status: safe array defaults to SAFE unless Local Knowledge says otherwise
-        const outcomeType = matchedOutcome.outcome || matchedOutcome.internalOutcome;
-        if (outcomeType === 'NOT AN OPTION') {
-          enriched.status = 'NOT AN OPTION';
-        } else {
-          enriched.status = 'SAFE';
-        }
-        
-        // PHASE 1: Add structured fields for Local Knowledge items
-        const guidanceText = matchedOutcome.bestReason || matchedOutcome.guidance || item.reason || 'Requires verification';
-        enriched.reasons = [{ type: 'UNKNOWN', detail: guidanceText }];
-        enriched.confidence = 'HIGH';
-        enriched.askServer = enriched.askServer || [];
-        
-        return enriched;
+        return item;
       }
       
       // No match: AI-only item - parse reason to structured format
@@ -829,18 +909,17 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
         const structured = parseReasonToStructured(item.reason, restrictions);
         return {
           ...item,
-          status: 'SAFE',
+          status: item.status || 'SAFE',
           reasons: structured.reasons,
           askServer: structured.askServer,
           confidence: structured.confidence,
           reasonCompat: deriveCompatibilityReason(structured.reasons, structured.askServer)
         };
       } catch (parseError) {
-        // Minimal logging only if parsing fails
         console.error('Error parsing reason for item:', item.name, parseError.message);
         return {
           ...item,
-          status: 'SAFE',
+          status: item.status || 'SAFE',
           reasons: [{ type: 'UNKNOWN', detail: item.reason || 'Requires verification' }],
           askServer: [`Can you confirm if this is ${restrictions.join(' and/or ')} free and how it's prepared?`],
           confidence: 'LOW'
@@ -848,38 +927,23 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
       }
     });
 
-    // Enrich caution array items
+    // Enrich caution array items (add structured fields, but preserve merge status)
     caution = caution.map(item => {
       const normalized = normalizeName(item.name || '');
       const matchedOutcome = localKnowledgeMap.get(normalized);
       
-      if (matchedOutcome) {
-        const enriched = { ...item };
-        // Attach metadata if available
-        if (Array.isArray(matchedOutcome.askServer) && matchedOutcome.askServer.length > 0) {
-          enriched.askServer = matchedOutcome.askServer;
+      // If item already has structured fields from merge, preserve them
+      if (item.reasons && item.askServer) {
+        // Already enriched by merge, just add metadata if available
+        if (matchedOutcome) {
+          if (Array.isArray(matchedOutcome.orderItLikeThis) && matchedOutcome.orderItLikeThis.length > 0) {
+            item.orderItLikeThis = matchedOutcome.orderItLikeThis;
+          }
+          if (matchedOutcome.bestReason && !item.bestReason) {
+            item.bestReason = matchedOutcome.bestReason;
+          }
         }
-        if (Array.isArray(matchedOutcome.orderItLikeThis) && matchedOutcome.orderItLikeThis.length > 0) {
-          enriched.orderItLikeThis = matchedOutcome.orderItLikeThis;
-        }
-        if (matchedOutcome.bestReason) {
-          enriched.bestReason = matchedOutcome.bestReason;
-        }
-        // Derive status: caution array defaults to ASK unless Local Knowledge says NOT AN OPTION
-        const outcomeType = matchedOutcome.outcome || matchedOutcome.internalOutcome;
-        if (outcomeType === 'NOT AN OPTION') {
-          enriched.status = 'NOT AN OPTION';
-        } else {
-          enriched.status = 'ASK';
-        }
-        
-        // PHASE 1: Add structured fields for Local Knowledge items
-        const guidanceText = matchedOutcome.bestReason || matchedOutcome.guidance || item.reason || 'Requires verification';
-        enriched.reasons = [{ type: 'UNKNOWN', detail: guidanceText }];
-        enriched.confidence = 'HIGH';
-        enriched.askServer = enriched.askServer || [];
-        
-        return enriched;
+        return item;
       }
       
       // No match: AI-only item - parse reason to structured format
@@ -887,18 +951,17 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
         const structured = parseReasonToStructured(item.reason, restrictions);
         return {
           ...item,
-          status: 'ASK',
+          status: item.status || 'ASK',
           reasons: structured.reasons,
           askServer: structured.askServer,
           confidence: structured.confidence,
           reasonCompat: deriveCompatibilityReason(structured.reasons, structured.askServer)
         };
       } catch (parseError) {
-        // Minimal logging only if parsing fails
         console.error('Error parsing reason for item:', item.name, parseError.message);
         return {
           ...item,
-          status: 'ASK',
+          status: item.status || 'ASK',
           reasons: [{ type: 'UNKNOWN', detail: item.reason || 'Requires verification' }],
           askServer: [`Can you confirm if this is ${restrictions.join(' and/or ')} free and how it's prepared?`],
           confidence: 'LOW'
@@ -906,13 +969,60 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
       }
     });
 
-    // Return structured response
-    res.json({
+    // Build simplified items list (fast response - no detailed why/ask)
+    const buildSimplifiedItem = (item, status, sourceArray) => {
+      const allergens = [];
+      if (item.allergens && Array.isArray(item.allergens)) {
+        allergens.push(...item.allergens);
+      } else if (merged.hard_stop && merged.hard_stop.some(hs => hs.name === item.name)) {
+        const hardStopItem = merged.hard_stop.find(hs => hs.name === item.name);
+        if (hardStopItem && hardStopItem.allergens) {
+          allergens.push(...hardStopItem.allergens);
+        }
+      }
+      
+      return {
+        id: `${sourceArray}_${item.name}`.replace(/\s+/g, '_').toLowerCase(),
+        name: item.name,
+        status: status,
+        allergens: allergens,
+        hasDetails: false,
+        _sourceArray: sourceArray
+      };
+    };
+
+    const items = [];
+    // Add safe items
+    for (const item of safe) {
+      items.push(buildSimplifiedItem(item, 'OK', 'safe'));
+    }
+    // Add caution items
+    for (const item of caution) {
+      items.push(buildSimplifiedItem(item, 'CAUTION', 'caution'));
+    }
+    // Add hard stop items
+    for (const item of merged.hard_stop) {
+      items.push(buildSimplifiedItem(item, 'HARD_STOP', 'hard_stop'));
+    }
+
+    const tResponseStart = Date.now();
+    // Build response
+    const responseData = {
       success: true,
-      safe: safe,
-      caution: caution,
+      items: items,
       disclaimer: 'Menu Safe is guidance only. Always confirm with restaurant staff.'
-    });
+    };
+    
+    // Store in cache
+    scanCache.set(cacheKey, responseData);
+    
+    const response_ms = Date.now() - tResponseStart;
+    const request_total_ms = Date.now() - requestStart;
+    
+    console.log(`PERF: cache_hit=false request_total_ms=${request_total_ms} ocr_ms=${ocr_ms || 0} local_rules_ms=${local_rules_ms || 0} ai_ms=${ai_ms} response_ms=${response_ms}`);
+    
+    // Return response
+    res.json(responseData);
 
   } catch (error) {
     console.error('OpenAI API error:', error);
@@ -963,6 +1073,140 @@ Return ALL menu items found in the image. Be comprehensive - include every singl
       error: 'PROCESSING_ERROR',
       message: error.message || 'Failed to analyze menu. Please try again with a clearer image.',
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Item details endpoint - returns detailed why/ask for a single item
+app.post('/api/item-details', async (req, res) => {
+  console.log('Received item-details request');
+  
+  const { itemName, restrictions, context } = req.body;
+  
+  if (!itemName || typeof itemName !== 'string') {
+    return res.status(400).json({
+      success: false,
+      error: 'INVALID_REQUEST',
+      message: 'itemName is required'
+    });
+  }
+  
+  if (!Array.isArray(restrictions) || restrictions.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: 'INVALID_REQUEST',
+      message: 'restrictions array is required'
+    });
+  }
+  
+  // Convert restrictions to toggledAllergens
+  const toggledAllergens = {
+    gluten: restrictions.includes('gluten'),
+    dairy: restrictions.includes('dairy')
+  };
+  
+  try {
+    // Check hard stop first (deterministic, no AI)
+    const hardStopResult = isHardStop(itemName, toggledAllergens);
+    if (hardStopResult.hardStop) {
+      return res.json({
+        success: true,
+        why: hardStopResult.reason,
+        ask: hardStopResult.ask || [],
+        status: 'HARD_STOP',
+        confidence: 'HIGH'
+      });
+    }
+    
+    // Check local knowledge
+    const localKnowledge = buildLocalKnowledgeContext(itemName, toggledAllergens);
+    if (localKnowledge && localKnowledge.outcomes && localKnowledge.outcomes.length > 0) {
+      const outcome = localKnowledge.outcomes[0]; // Use first outcome
+      return res.json({
+        success: true,
+        why: outcome.bestReason || outcome.guidance || 'Requires verification',
+        ask: outcome.askServer || [],
+        status: outcome.outcome === 'NOT AN OPTION' ? 'NOT_AN_OPTION' : 'CAUTION',
+        confidence: 'HIGH'
+      });
+    }
+    
+    // Use AI for single item analysis
+    if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY.includes('your_openai_api_key')) {
+      return res.status(500).json({
+        success: false,
+        error: 'CONFIG_ERROR',
+        message: 'OpenAI API key not configured'
+      });
+    }
+    
+    const restrictionsText = restrictions.join(' and/or ');
+    const restrictionDetails = restrictions.map(r => {
+      if (r === 'gluten') return 'gluten (wheat, flour, bread, pasta, croutons, breading, batter)';
+      if (r === 'dairy') return 'dairy (cheese, milk, butter, cream, yogurt, sour cream, whey)';
+      return r;
+    }).join(' and/or ');
+    
+    const aiResponse = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a dietary restriction analyzer. Analyze a single menu item and return ONLY valid JSON with no markdown formatting, no code blocks, no extra text.`
+        },
+        {
+          role: 'user',
+          content: `Analyze this menu item for ${restrictionDetails} restrictions:
+
+Item: "${itemName}"
+${context ? `Context: ${context}` : ''}
+
+Return JSON:
+{
+  "why": "Brief explanation of why this item is flagged (or 'Generally safe' if OK)",
+  "ask": ["Question 1", "Question 2", "Question 3"]
+}
+
+Rules:
+- If item contains restricted ingredients that cannot be removed, explain why
+- If item may contain restricted ingredients, explain the risk
+- Provide 2-3 specific questions to ask the server
+- Be concise and practical`
+        }
+      ],
+      max_tokens: 500,
+      temperature: 0.2,
+      response_format: { type: 'json_object' }
+    });
+    
+    const content = aiResponse.choices[0].message.content;
+    let details;
+    
+    try {
+      details = JSON.parse(content);
+    } catch (parseError) {
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        details = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error('Invalid response format from AI');
+      }
+    }
+    
+    return res.json({
+      success: true,
+      why: details.why || 'Requires verification',
+      ask: Array.isArray(details.ask) ? details.ask : [details.ask].filter(Boolean),
+      status: 'CAUTION',
+      confidence: 'MEDIUM'
+    });
+    
+  } catch (error) {
+    console.error('Error getting item details:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'PROCESSING_ERROR',
+      message: error.message || 'Failed to get item details'
     });
   }
 });

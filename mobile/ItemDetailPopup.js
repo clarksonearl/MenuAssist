@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Modal,
   View,
@@ -7,6 +7,7 @@ import {
   ScrollView,
   StyleSheet,
   Dimensions,
+  ActivityIndicator,
 } from 'react-native';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -55,8 +56,11 @@ export default function ItemDetailPopup({ visible, item, activeRestrictions = { 
     return '#FF9500'; // Orange for CAUTION
   };
 
-  // Extract reasons - handle both array and single string
+  // Extract reasons - use fetched details or fallback to item fields
   const getReasons = () => {
+    if (details && details.why) {
+      return [details.why];
+    }
     if (Array.isArray(item.reasons) && item.reasons.length > 0) {
       return item.reasons.map(r => typeof r === 'string' ? r : r.detail).filter(Boolean);
     }
@@ -78,6 +82,11 @@ export default function ItemDetailPopup({ visible, item, activeRestrictions = { 
 
   // Generate restriction-aware questions based on active restrictions and item reasons
   const getAskQuestions = () => {
+    // Use fetched details first
+    if (details && details.ask && Array.isArray(details.ask) && details.ask.length > 0) {
+      return details.ask;
+    }
+    
     // Use prop first, fallback to item._activeRestrictions if prop not provided
     const restrictions = activeRestrictions && (activeRestrictions.gluten !== undefined || activeRestrictions.dairy !== undefined)
       ? activeRestrictions
@@ -255,37 +264,60 @@ export default function ItemDetailPopup({ visible, item, activeRestrictions = { 
             keyboardShouldPersistTaps="handled"
             bounces={true}
           >
+            {/* Loading state */}
+            {loadingDetails && (
+              <View style={styles.section}>
+                <ActivityIndicator size="small" color="#007AFF" />
+                <Text style={styles.loadingText}>Loading details...</Text>
+              </View>
+            )}
+
+            {/* Error state */}
+            {detailsError && !loadingDetails && (
+              <View style={styles.section}>
+                <Text style={styles.errorText}>{detailsError}</Text>
+              </View>
+            )}
+
             {/* Why section */}
-            <View style={[styles.section, { marginTop: 0 }]}>
-              <Text style={styles.sectionTitle}>Why</Text>
-              {reasons.length > 0 ? (
-                reasons.length === 1 && typeof reasons[0] === 'string' && reasons[0].length > 100 ? (
-                  // Single long string - render as paragraph
-                  <Text style={styles.sectionText}>{reasons[0]}</Text>
+            {!loadingDetails && (
+              <View style={[styles.section, { marginTop: 0 }]}>
+                <Text style={styles.sectionTitle}>Why</Text>
+                {reasons.length > 0 ? (
+                  reasons.length === 1 && typeof reasons[0] === 'string' && reasons[0].length > 100 ? (
+                    // Single long string - render as paragraph
+                    <Text style={styles.sectionText}>{reasons[0]}</Text>
+                  ) : (
+                    // Array or short strings - render as bullets
+                    reasons.map((reason, index) => (
+                      <View key={index} style={styles.bulletItem}>
+                        <Text style={styles.bullet}>•</Text>
+                        <Text style={styles.bulletText}>{reason}</Text>
+                      </View>
+                    ))
+                  )
                 ) : (
-                  // Array or short strings - render as bullets
-                  reasons.map((reason, index) => (
-                    <View key={index} style={styles.bulletItem}>
-                      <Text style={styles.bullet}>•</Text>
-                      <Text style={styles.bulletText}>{reason}</Text>
-                    </View>
-                  ))
-                )
-              ) : (
-                <Text style={styles.sectionText}>Requires verification</Text>
-              )}
-            </View>
+                  <Text style={styles.sectionText}>Requires verification</Text>
+                )}
+              </View>
+            )}
 
             {/* What to ask section */}
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>What to ask your server</Text>
-              {askQuestions.map((question, index) => (
-                <View key={index} style={styles.bulletItem}>
-                  <Text style={styles.bullet}>•</Text>
-                  <Text style={styles.bulletText}>{question}</Text>
-                </View>
-              ))}
-            </View>
+            {!loadingDetails && (
+              <View style={styles.section}>
+                <Text style={styles.sectionTitle}>What to ask your server</Text>
+                {askQuestions.length > 0 ? (
+                  askQuestions.map((question, index) => (
+                    <View key={index} style={styles.bulletItem}>
+                      <Text style={styles.bullet}>•</Text>
+                      <Text style={styles.bulletText}>{question}</Text>
+                    </View>
+                  ))
+                ) : (
+                  <Text style={styles.sectionText}>No questions available</Text>
+                )}
+              </View>
+            )}
           </ScrollView>
 
           {/* Close button */}
@@ -433,6 +465,18 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 16,
     fontWeight: '600',
+  },
+  loadingText: {
+    fontSize: 15,
+    color: '#666',
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  errorText: {
+    fontSize: 15,
+    color: '#FF3B30',
+    marginTop: 8,
+    textAlign: 'center',
   },
 });
 
