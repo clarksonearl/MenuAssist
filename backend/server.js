@@ -27,7 +27,8 @@ const openai = new OpenAI({
 app.use(cors());
 
 // Middleware to parse JSON bodies
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 
 // Health endpoint
 app.get('/api/health', (req, res) => {
