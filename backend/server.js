@@ -13,9 +13,7 @@ const PORT = process.env.PORT || 3000;
 // Configure multer for file uploads (memory storage)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
-  }
+  limits: { fileSize: 10 * 1024 * 1024 }
 });
 
 // Initialize OpenAI client
