@@ -142,6 +142,11 @@ export default function App() {
       const imageSizeBytes = fileInfo.exists ? fileInfo.size : 0;
       const optimized_file_kb = imageSizeBytes / 1024;
 
+      // Debug logs before upload
+      console.log('DEBUG: optimized.uri:', optimized?.uri);
+      console.log('DEBUG: fileInfo.exists:', fileInfo.exists);
+      console.log('DEBUG: fileInfo.size:', fileInfo.size);
+
       // Make API call with multipart/form-data
       const apiUrl = `${getApiBaseUrl()}/api/analyze-menu`;
       const tUploadStart = Date.now();
@@ -172,13 +177,22 @@ export default function App() {
       const upload_ms = Date.now() - tUploadStart;
       const backend_ms = upload_ms;
 
+      // Log response status and body
+      const responseText = await response.text();
+      console.log('DEBUG: response.status:', response.status);
+      console.log('DEBUG: response.body:', responseText);
+
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.message || `Server error: ${response.status}`);
+        try {
+          const errorData = JSON.parse(responseText);
+          throw new Error(errorData.message || errorData.error || `Server error: ${response.status}`);
+        } catch (parseError) {
+          throw new Error(`Server error: ${response.status}`);
+        }
       }
 
       const tRenderStart = Date.now();
-      const data = await response.json();
+      const data = JSON.parse(responseText);
       
       // Transform new response format to old format for compatibility
       if (data.items && Array.isArray(data.items)) {
