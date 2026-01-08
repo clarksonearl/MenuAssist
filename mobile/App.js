@@ -151,9 +151,14 @@ export default function App() {
       const apiUrl = `${getApiBaseUrl()}/api/analyze-menu`;
       const tUploadStart = Date.now();
       
+      // Normalize URI for iOS (requires file:// prefix)
+      const imageUri = optimized.uri.startsWith('file://')
+        ? optimized.uri
+        : `file://${optimized.uri}`;
+      
       const formData = new FormData();
       formData.append('image', {
-        uri: optimized.uri,
+        uri: imageUri,
         name: 'menu.jpg',
         type: 'image/jpeg',
       });
