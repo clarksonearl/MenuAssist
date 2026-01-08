@@ -40,13 +40,19 @@ app.post('/api/analyze-menu', upload.single('image'), async (req, res) => {
   const requestStart = Date.now();
   console.log('Received analyze-menu request');
   
+  // TEMPORARY debug logs
+  console.log('DEBUG: content-type:', req.headers['content-type']);
+  console.log('DEBUG: req.file exists:', Boolean(req.file));
+  if (req.file) {
+    console.log('DEBUG: req.file.fieldname:', req.file.fieldname);
+    console.log('DEBUG: req.file.mimetype:', req.file.mimetype);
+    console.log('DEBUG: req.file.size:', req.file.size);
+  }
+  console.log('DEBUG: req.body keys:', Object.keys(req.body));
+  
   // Validate file upload
   if (!req.file) {
-    return res.status(400).json({
-      success: false,
-      error: 'INVALID_REQUEST',
-      message: 'Image file required'
-    });
+    return res.status(400).json({ error: 'Image file required' });
   }
   
   console.log('Image file size:', req.file.size, 'bytes');
@@ -55,9 +61,9 @@ app.post('/api/analyze-menu', upload.single('image'), async (req, res) => {
   // Validate restrictions from form data
   let restrictions;
   try {
-    restrictions = JSON.parse(req.body.restrictions || '[]');
+    restrictions = JSON.parse(req.body.prefs || req.body.restrictions || '[]');
   } catch (e) {
-    restrictions = Array.isArray(req.body.restrictions) ? req.body.restrictions : [];
+    restrictions = Array.isArray(req.body.prefs || req.body.restrictions) ? (req.body.prefs || req.body.restrictions) : [];
   }
   
   if (!Array.isArray(restrictions) || restrictions.length === 0) {

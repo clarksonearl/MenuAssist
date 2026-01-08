@@ -149,10 +149,10 @@ export default function App() {
       const formData = new FormData();
       formData.append('image', {
         uri: optimized.uri,
-        type: 'image/jpeg',
         name: 'menu.jpg',
+        type: 'image/jpeg',
       });
-      formData.append('restrictions', JSON.stringify(restrictions));
+      formData.append('prefs', JSON.stringify(restrictions));
       
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout for deep analysis
