@@ -3,15 +3,20 @@
     "name": "mobile",
     "slug": "mobile",
     "version": "1.0.0",
+    "runtimeVersion": "1.0.2",
+
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+
+    "icon": "./assets/icon.png",
+
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
+
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
@@ -19,6 +24,7 @@
         "NSCameraUsageDescription": "This app needs access to your camera to take photos of menus."
       }
     },
+
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -27,25 +33,24 @@
       "edgeToEdgeEnabled": true,
       "permissions": [
         "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.CAMERA",
-        "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.CAMERA"
       ]
     },
+
     "web": {
       "favicon": "./assets/favicon.png"
     },
+
+    "updates": {
+      "url": "https://u.expo.dev/ac0d1db4-b30d-4b80-8918-22fd884b27f3"
+    },
+
     "extra": {
       "eas": {
         "projectId": "ac0d1db4-b30d-4b80-8918-22fd884b27f3"
       }
     },
-    "owner": "clarksonearl",
-    "runtimeVersion": {
-      "policy": "appVersion"
-    },
-    "updates": {
-      "url": "https://u.expo.dev/ac0d1db4-b30d-4b80-8918-22fd884b27f3"
-    }
+
+    "owner": "clarksonearl"
   }
 }
